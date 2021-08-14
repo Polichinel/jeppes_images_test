@@ -282,3 +282,59 @@ def plot_img_subset(df, feature, show = False):
 
     if show == True:  
         plt.show()
+
+
+def meta_to_df(df, path):
+
+    """Returns new df with meta data from images. Needs old df and path to images"""
+
+    df_expanded = df.copy()
+    dict_keys = get_meta_keys()
+
+    # create empty columns
+    for k in dict_keys:    
+        df_expanded[k] = np.nan #pd.NA #None
+
+    # get IPCT info fro each img_id
+    for i in df_expanded['img_id']:#[0:1]:
+
+        #print(i) # for debug
+
+        filename = i + '.jpg'
+        file_path = os.path.join(path, filename)
+        info = IPTCInfo(file_path, force=True)
+        
+        # Fill IPTC info into columns for i img_id
+        for j in dict_keys:
+
+            #print(j)  # for debug
+
+            if info[j] != None:
+                if len(info[j]) > 0:
+
+                    #print(info[j])
+                    #print(type(info[j]))
+                    #print(len(info[j]))
+
+                    if type(info[j]) == bytes:
+                        # Just decode and add
+                        df_expanded.loc[df_expanded['img_id'] == i, j] = info[j].decode('utf-8')
+
+                    elif type(info[j]) == list:
+                        # decode each entry in the list
+                        temp_list = []
+                        for n in info[j]:
+                            temp_list.append(n.decode('utf-8'))
+
+                        #print(temp_list)
+                        # Make the list into a series of list fitting the size of the data frame slice
+                        temp_list_series = pd.Series([temp_list] * df_expanded.loc[df_expanded['img_id'] == i, j].shape[0]) # it is a hack...
+                        df_expanded.loc[df_expanded['img_id'] == i, j] = temp_list_series
+
+                    else:
+                        # just add
+                        df_expanded.loc[df_expanded['img_id'] == i, j] = info[j]
+
+    # remove columns with all NaNs
+    df_cleaned = df_expanded.dropna(axis=1, how='all')
+    return(df_cleaned)
