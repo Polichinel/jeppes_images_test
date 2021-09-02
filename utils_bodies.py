@@ -14,6 +14,14 @@ import seaborn as sns
 import matplotlib.pyplot as plt
 from matplotlib.patches import Rectangle
 
+import torch
+import torchvision
+
+
+
+# FUNCTIONS: ---------------------------------------------------------------------------------
+
+
 def get_meta_keys():
 
     """Returns the 'dict_keys' for the IPTCInfo"""
@@ -338,3 +346,203 @@ def meta_to_df(df, path):
     # remove columns with all NaNs
     df_cleaned = df_expanded.dropna(axis=1, how='all')
     return(df_cleaned)
+
+
+def plot_boundry_boxes(dataset, images, targets, predictions):
+
+    """Function for sanity check. Takes the dataset construted via the class MyDatast, 
+    the images and targets extracted from said dataset ia dataloader, 
+    and the predictions obtained via the Faster R-CNN. Returns/displays images with taget
+    and predicted boundry boxes. 
+    Right now the function still expect the coco classes for the predictions."""
+
+    # dict for targets, int to str
+    t_inst_classes = dataset.target_classes()
+    inst_classes = dataset.coco_classes()
+
+    for i,j in enumerate(images): # iterate over images i
+        img = j[0].detach().numpy() # detach from device and tensor to numpy. j is now a touple with one entry... idk..
+        img = img.squeeze() # remove batch dim so b,c,h,w -> c,h,w
+        img = np.moveaxis(img, 0, -1) # move channels back so c,h,w -> h,w,c
+        # note image is still range (0,1)
+
+        threshold = .8 # needs to be and input to the function
+        color1 = 'orange' # needs to vary according to class
+        color2 = 'salmon' # needs to vary according to class
+
+
+        n_obj = predictions[i]['boxes'].shape[0]
+
+        #plot prediction boundry boxes
+        for k in range(n_obj): # iterate over objects j in image i
+            
+            if predictions[i]['scores'][k] > threshold: # is the predictions clear the threshold
+
+                box = predictions[i]['boxes'][k].detach().numpy() # boxes in xmin, ymin, xmax, ymax format
+
+                xmin = box[0]
+                ymin = box[1]
+                xmax = box[2]
+                ymax = box[3]
+
+                xdiff = xmax - xmin
+                ydiff = ymax - ymin
+
+                plt.annotate(inst_classes[predictions[i]['labels'][k]], [xmin, ymax], fontsize = 20, color = color1) 
+                # you use inst_classes here!!! that list needs to be loaded from somewhere..
+                            
+                rect = Rectangle((xmin, ymin),xdiff,ydiff,linewidth = 2, edgecolor = color1, facecolor='none')
+                    
+                ax = plt.gca()
+                ax.add_patch(rect)
+
+        #plot target boundry boxes. if-statment handelse images with only one box = one less dim.
+        if len(targets[i]['boxes'].shape) == 3:
+            t_obj = targets[i]['boxes'].squeeze()
+            t_label = targets[i]['labels'].squeeze()
+
+        elif len(targets[i]['boxes'].shape) == 2:
+            t_obj = targets[i]['boxes']
+            t_label = targets[i]['labels']
+
+        else:
+            print('wrong dims...')
+
+        for m, l in enumerate(t_obj): # for target l in images i. and squeeze to remove batch dim
+                
+                t_box = l.detach().numpy() # boxes in xmin, ymin, xmax, ymax format
+
+                t_xmin = t_box[0]
+                t_ymin = t_box[1]
+                t_xmax = t_box[2]
+                t_ymax = t_box[3]
+
+                t_xdiff = t_xmax - t_xmin
+                t_ydiff = t_ymax - t_ymin
+
+                plt.annotate(t_inst_classes[t_label[m].item()], [t_xmin, t_ymax], fontsize = 20, color = color2)
+                            
+                t_rect = Rectangle((t_xmin, t_ymin), t_xdiff, t_ydiff, linewidth = 2, edgecolor = color2, facecolor='none')
+                    
+                ax = plt.gca()
+                ax.add_patch(t_rect)
+
+        # plot image 
+        plt.imshow(img)
+        plt.title('test')
+
+        plt.show()
+
+
+
+    # CLASSES: ---------------------------------------------------------------------------------
+
+class MyDataset(torch.utils.data.Dataset):
+    def __init__(self, root = '/home/simon/Documents/Bodies/data/jeppe/', transforms = None):
+        self.root = root
+        self.transforms = transforms
+        self.boxes = [i for i in list(sorted(os.listdir(os.path.join(root, "images")))) if str(i).split('.')[1] == 'xml'] # list of xml files (box info)
+        self.imgs = [f"{i.split('.')[0]}.jpg" for i in self.boxes] # list of images - only take images with box info!
+        #self.imgs = [i for i in list(sorted(os.listdir(os.path.join(root, "images")))) if str(i).split('.')[1] == 'jpg'] # list of images
+        self.classes = open(os.path.join(root, "images/classes.txt"),"r").read().split('\n')[0:-1] # the classes from the classes.txt file
+        self.classes_int = np.arange(1,len(self.classes)+1) # from 1 since no background '0'
+
+    def __getitem__(self, idx):
+        # dict to convert classes into classes_int
+        class_to_int = dict(zip(self.classes,self.classes_int))        
+
+        # load images
+        img_path = os.path.join(self.root, "images", self.imgs[idx])
+        box_path = os.path.join(self.root, "images", self.boxes[idx])
+        
+        #img = Image.open(img_path).convert("RGB") # maybe you also need the dim and norm stuff here.
+        img = cv2.imread(img_path)
+        img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+        img = np.moveaxis(img, -1, 0) # move channels in front so h,w,c -> c,h,w
+        img = img / 255.0 # norm ot range 0-1. Might move out..
+        img = torch.Tensor(img)
+
+        # Open xml path 
+        tree = ElementTree.parse(box_path)
+
+        lst_obj = tree.findall('object')
+        lst_size = tree.findall('size') # are you using this?
+        num_objs = len(lst_obj) # number of objects
+
+        obj_name = []
+        obj_ids = []
+        boxes = []
+
+        for i in lst_obj:
+
+            obj_name.append(i.find('name').text) # get the actual class name
+            obj_ids.append(class_to_int[i.find('name').text]) # get the int associated with the class name
+            lst_box = i.findall('bndbox')
+
+            for j in lst_box:
+
+                xmin = float(j.find('xmin').text)
+                xmax = float(j.find('xmax').text)
+                ymin = float(j.find('ymin').text)
+                ymax = float(j.find('ymax').text)
+                boxes.append([xmin, ymin, xmax, ymax])
+                # boxes.extend([xmin, ymin, xmax, ymax])
+
+        # come bad boxes
+        # keep = (boxes[:, 3] > boxes[:, 1]) & (boxes[:, 2] > boxes[:, 0]) 
+        # boxes = boxes[keep]
+        # assert xmin >= 0
+        # assert xmin < xmax
+        # assert ymin >= 0
+        # assert ymin < ymax
+
+        # convert everything into a torch.Tensor
+        boxes = torch.as_tensor(boxes, dtype=torch.float32)
+        labels = torch.as_tensor(obj_ids, dtype=torch.int64)
+
+        image_id = torch.tensor([idx])
+        area = (boxes[:, 3] - boxes[:, 1]) * (boxes[:, 2] - boxes[:, 0])
+        
+        # suppose all instances are not crowd
+        iscrowd = torch.zeros((num_objs,), dtype=torch.int64)
+
+        # Idk i squeeze helps or is warrented here...
+        target = {}
+        #target["boxes"] = boxes.squeeze()
+        target["boxes"] = boxes #.view(-1,4)
+        target["labels"] = labels #.squeeze()
+        target["image_id"] = image_id #.squeeze()
+        target["area"] = area #.squeeze()
+        target["iscrowd"] = iscrowd #.squeeze()
+
+        if self.transforms is not None:
+            img = self.transforms(img)
+
+        # return img, [target] # target now in list....
+        return img, target # target now in list....
+
+
+    def __len__(self):
+        return len(self.imgs) # right now you do not differentiate between annotated images and not annotated images... 
+
+
+    def target_classes(self):
+        t_inst_classes = dict(zip(self.classes_int,self.classes)) # just a int to string dict
+        return(t_inst_classes)
+
+    def coco_classes(self):
+        inst_classes = [
+            '__background__', 'person', 'bicycle', 'car', 'motorcycle', 'airplane', 'bus',
+            'train', 'truck', 'boat', 'traffic light', 'fire hydrant', 'N/A', 'stop sign',
+            'parking meter', 'bench', 'bird', 'cat', 'dog', 'horse', 'sheep', 'cow',
+            'elephant', 'bear', 'zebra', 'giraffe', 'N/A', 'backpack', 'umbrella', 'N/A', 'N/A',
+            'handbag', 'tie', 'suitcase', 'frisbee', 'skis', 'snowboard', 'sports ball',
+            'kite', 'baseball bat', 'baseball glove', 'skateboard', 'surfboard', 'tennis racket',
+            'bottle', 'N/A', 'wine glass', 'cup', 'fork', 'knife', 'spoon', 'bowl',
+            'banana', 'apple', 'sandwich', 'orange', 'broccoli', 'carrot', 'hot dog', 'pizza',
+            'donut', 'cake', 'chair', 'couch', 'potted plant', 'bed', 'N/A', 'dining table',
+            'N/A', 'N/A', 'toilet', 'N/A', 'tv', 'laptop', 'mouse', 'remote', 'keyboard', 'cell phone',
+            'microwave', 'oven', 'toaster', 'sink', 'refrigerator', 'N/A', 'book',
+            'clock', 'vase', 'scissors', 'teddy bear', 'hair drier', 'toothbrush'] # a "ordered" list of the coco categories
+        return(inst_classes) 
+
