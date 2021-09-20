@@ -1,6 +1,7 @@
 import os
 import re
 from xml.etree import ElementTree, ElementInclude
+from collections import Counter
 
 import iptcinfo3
 from iptcinfo3 import IPTCInfo
@@ -435,9 +436,331 @@ def plot_boundry_boxes(dataset, images, targets, predictions):
 
 
 
-    # CLASSES: ---------------------------------------------------------------------------------
-
+# CLASSES: ---------------------------------------------------------------------------------
 class MyDataset(torch.utils.data.Dataset):
+    def __init__(self, root = '/home/simon/Documents/Bodies/data/jeppe/', transforms = None, n_obs = 100):
+        self.root = root
+        self.transforms = transforms
+        self.n_obs = n_obs
+
+        # the selection need to happen here
+        self.classes = [''] + self.__get_classes__() # list of classes accroding to n_obs, see __get_classes__
+        self.classes_int = np.arange(0,len(self.classes)) # from 1 since no background '0'
+        self.boxes = self.__get_boxes__() # list of xml files (box info) to n_obs, see __get_classes__
+        self.imgs = [f"{i.split('.')[0]}.jpg" for i in self.boxes] # list of images - only take images with box info! and > n_obs
+             
+    def __get_classes__(self):
+        """Creates a list of classes with >= n_obs observations"""
+        n_obs = self.n_obs
+        path = os.path.join(self.root, "images")
+
+        obj_name = []
+        classes = []
+
+        # Get all objects that have been annotated
+        for filename in os.listdir(path):
+            if filename.split('.')[1] == 'xml':
+                box_path = os.path.join(path, filename)
+
+                tree = ElementTree.parse(box_path)
+                lst_obj = tree.findall('object')
+
+                for j in lst_obj:
+                    obj_name.append(j.find('name').text)
+
+
+        # now, only keep the objects w/ >= n_obs observations
+        c = Counter(obj_name)
+
+        for i in c.items():
+            if i[1] >= n_obs:
+                classes.append(i[0])
+        
+        return(classes)
+
+    def __get_boxes__(self):
+        """Make sure you only get images with valid boxes frrom the classes list - see __get_classes__"""
+
+        path = os.path.join(self.root, "images")
+
+        boxes = []
+        # Get all objects that have been annotated
+        for filename in os.listdir(path):
+            if filename.split('.')[1] == 'xml':
+                box_path = os.path.join(path, filename)
+
+                tree = ElementTree.parse(box_path)
+                lst_obj = tree.findall('object')
+
+                # If there is one or more objects from the classes list, save the box filename
+                if len(set([j.find('name').text for j in lst_obj]) & set(self.classes)) > 0:
+                    boxes.append(filename)
+
+        # Sort and return the boxes
+        boxes = sorted(boxes)
+        return(boxes)
+
+    def __getitem__(self, idx):
+        # dict to convert classes into classes_int
+        class_to_int = dict(zip(self.classes,self.classes_int))        
+
+        # load images
+        img_path = os.path.join(self.root, "images", self.imgs[idx])
+        box_path = os.path.join(self.root, "images", self.boxes[idx])
+        
+        img = cv2.imread(img_path)
+        img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+
+        # Resize img 800x800 --------------------------------------------
+        target_size = 800
+
+        y_orig_size = img.shape[0] # the original y shape
+        x_orig_size = img.shape[1] # the original x shape
+        y_scale = target_size/y_orig_size # scale factor for boxes
+        x_scale = target_size/x_orig_size # scale factor for boxes
+
+        img = cv2.resize(img, (target_size, target_size))
+        # ----------------------------------------------------------------
+
+        img = np.moveaxis(img, -1, 0) # move channels in front so h,w,c -> c,h,w
+        img = img / 255.0 # norm ot range 0-1. Might move out..
+        img = torch.Tensor(img)
+
+        # Open xml path 
+        tree = ElementTree.parse(box_path)
+
+        lst_obj = tree.findall('object')
+
+        obj_name = []
+        obj_ids = []
+        boxes = []
+
+        for i in lst_obj:
+        # here you need to ignore classes w/ n > n_obs
+
+            obj_name_str = i.find('name').text
+            if obj_name_str in self.classes:
+
+                obj_name.append(obj_name_str) # get the actual class name
+                obj_ids.append(class_to_int[i.find('name').text]) # get the int associated with the class name
+                lst_box = i.findall('bndbox')
+
+                for j in lst_box:
+
+                    xmin = float(j.find('xmin').text) * x_scale # scale factor to fit resized image
+                    xmax = float(j.find('xmax').text) * x_scale
+                    ymin = float(j.find('ymin').text) * y_scale
+                    ymax = float(j.find('ymax').text) * y_scale
+                    boxes.append([xmin, ymin, xmax, ymax])
+            else:
+                pass
+
+        num_objs = len(obj_ids) # number of objects
+
+        # convert everything into a torch.Tensor
+        boxes = torch.as_tensor(boxes, dtype=torch.float32)
+        labels = torch.as_tensor(obj_ids, dtype=torch.int64)
+        image_id = torch.tensor([idx])
+        area = (boxes[:, 3] - boxes[:, 1]) * (boxes[:, 2] - boxes[:, 0])
+
+        # suppose all instances are not crowd
+        iscrowd = torch.zeros((num_objs,), dtype=torch.int64)
+
+        target = {}
+        target["boxes"] = boxes 
+        target["labels"] = labels
+        target["image_id"] = image_id 
+        target["area"] = area
+        target["iscrowd"] = iscrowd 
+
+        if self.transforms is not None:
+            img = self.transforms(img)
+
+        return img, target
+
+    def __len__(self):
+        return len(self.imgs) # right now you do not differentiate between annotated images and not annotated images... 
+
+
+    def target_classes(self):
+        t_inst_classes = dict(zip(self.classes_int,self.classes)) # just a int to string dict
+        return(t_inst_classes)
+
+    def coco_classes(self):
+        inst_classes = [
+            '__background__', 'person', 'bicycle', 'car', 'motorcycle', 'airplane', 'bus',
+            'train', 'truck', 'boat', 'traffic light', 'fire hydrant', 'N/A', 'stop sign',
+            'parking meter', 'bench', 'bird', 'cat', 'dog', 'horse', 'sheep', 'cow',
+            'elephant', 'bear', 'zebra', 'giraffe', 'N/A', 'backpack', 'umbrella', 'N/A', 'N/A',
+            'handbag', 'tie', 'suitcase', 'frisbee', 'skis', 'snowboard', 'sports ball',
+            'kite', 'baseball bat', 'baseball glove', 'skateboard', 'surfboard', 'tennis racket',
+            'bottle', 'N/A', 'wine glass', 'cup', 'fork', 'knife', 'spoon', 'bowl',
+            'banana', 'apple', 'sandwich', 'orange', 'broccoli', 'carrot', 'hot dog', 'pizza',
+            'donut', 'cake', 'chair', 'couch', 'potted plant', 'bed', 'N/A', 'dining table',
+            'N/A', 'N/A', 'toilet', 'N/A', 'tv', 'laptop', 'mouse', 'remote', 'keyboard', 'cell phone',
+            'microwave', 'oven', 'toaster', 'sink', 'refrigerator', 'N/A', 'book',
+            'clock', 'vase', 'scissors', 'teddy bear', 'hair drier', 'toothbrush'] # a "ordered" list of the coco categories
+        return(inst_classes) 
+
+
+
+# OLD ---------------------------------------------------------------------------------------------------
+class MyDataset2(torch.utils.data.Dataset):
+    def __init__(self, root = '/home/simon/Documents/Bodies/data/jeppe/', transforms = None):
+        self.root = root
+        self.transforms = transforms
+        self.boxes = [i for i in list(sorted(os.listdir(os.path.join(root, "images")))) if str(i).split('.')[1] == 'xml'] # list of xml files (box info)
+        self.imgs = [f"{i.split('.')[0]}.jpg" for i in self.boxes] # list of images - only take images with box info!
+        #self.classes = open(os.path.join(root, "images/classes.txt"),"r").read().split('\n')[0:-1] # the classes from the classes.txt file
+        # self.classes = ['background'] + self.__get_classes__()
+        self.classes = [''] + self.__get_classes__() # 0 index reserved for background
+
+        self.classes_int = np.arange(0,len(self.classes)) # from 1 since no background '0'
+
+    def __get_classes__(self, n_obs = 150):
+        """Creates a list of classes with >= n_obs observations"""
+
+        path = os.path.join(self.root, "images")
+
+        obj_name = []
+        classes = []
+
+        # Get all objects that have been annotated
+        for filename in os.listdir(path):
+            if filename.split('.')[1] == 'xml':
+                box_path = os.path.join(path, filename)
+
+                tree = ElementTree.parse(box_path)
+                lst_obj = tree.findall('object')
+
+                for j in lst_obj:
+                    obj_name.append(j.find('name').text)
+
+
+        # now, only keep the objects w/ >= n_obs observations
+        c = Counter(obj_name)
+
+        for i in c.items():
+            if i[1] >= n_obs:
+                classes.append(i[0])
+        
+        return(classes)
+
+    def __getitem__(self, idx):
+        # dict to convert classes into classes_int
+        class_to_int = dict(zip(self.classes,self.classes_int))        
+
+        # load images
+        img_path = os.path.join(self.root, "images", self.imgs[idx])
+        box_path = os.path.join(self.root, "images", self.boxes[idx])
+        
+        #img = Image.open(img_path).convert("RGB") # maybe you also need the dim and norm stuff here.
+        img = cv2.imread(img_path)
+        img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+
+        # Resize img 800x800 --------------------------------------------
+        target_size = 800
+
+        y_orig_size = img.shape[0] # the original y shape (indx before you move channels )
+        x_orig_size = img.shape[1] # the original x shape (indx before you move channels )
+        y_scale = target_size/y_orig_size # scale factor for boxes
+        x_scale = target_size/x_orig_size # scale factor for boxes
+
+        img = cv2.resize(img, (target_size, target_size))
+        # ----------------------------------------------------------------
+
+        img = np.moveaxis(img, -1, 0) # move channels in front so h,w,c -> c,h,w
+        img = img / 255.0 # norm ot range 0-1. Might move out..
+        img = torch.Tensor(img)
+
+        # Open xml path 
+        tree = ElementTree.parse(box_path)
+
+        lst_obj = tree.findall('object')
+        # lst_size = tree.findall('size') # are you using this?
+
+        obj_name = []
+        obj_ids = []
+        boxes = []
+
+        for i in lst_obj:
+
+            obj_name_str = i.find('name').text
+            if obj_name_str in self.classes: # only keep the object if it is in your list of classes. See __get_classes__
+
+                obj_name.append(obj_name_str) # get the actual class name
+                obj_ids.append(class_to_int[i.find('name').text]) # get the int associated with the class name
+                lst_box = i.findall('bndbox')
+
+                for j in lst_box:
+
+                    xmin = float(j.find('xmin').text) * x_scale # scale factor to fit resized image
+                    xmax = float(j.find('xmax').text) * x_scale
+                    ymin = float(j.find('ymin').text) * y_scale
+                    ymax = float(j.find('ymax').text) * y_scale
+                    boxes.append([xmin, ymin, xmax, ymax])
+            
+            else:
+                pass
+
+        num_objs = len(obj_ids) # number of objects
+
+        # convert everything into a torch.Tensor
+        boxes = torch.as_tensor(boxes, dtype=torch.float32)
+        labels = torch.as_tensor(obj_ids, dtype=torch.int64)
+
+        image_id = torch.tensor([idx])
+
+        # temp selution to when all the classes are droped for being too rare. So boxes is empty list...
+        if len(torch.as_tensor(boxes, dtype=torch.float32)) == 0:
+            area = 0
+
+        else:
+            area = (boxes[:, 3] - boxes[:, 1]) * (boxes[:, 2] - boxes[:, 0])
+        # ------------------------------------------------------------------------------------------------
+
+        # suppose all instances are not crowd
+        iscrowd = torch.zeros((num_objs,), dtype=torch.int64)
+
+        # Idk i squeeze helps or is warrented here...
+        target = {}
+        target["boxes"] = boxes #.view(-1,4)
+        target["labels"] = labels #.squeeze()
+        target["image_id"] = image_id #.squeeze()
+        target["area"] = area #.squeeze()
+        target["iscrowd"] = iscrowd #.squeeze()
+
+        if self.transforms is not None:
+            img = self.transforms(img)
+
+        return img, target
+
+
+    def __len__(self):
+        return len(self.imgs) # right now you do not differentiate between annotated images and not annotated images... 
+
+
+    def target_classes(self):
+        t_inst_classes = dict(zip(self.classes_int,self.classes)) # just a int to string dict
+        return(t_inst_classes)
+
+    def coco_classes(self):
+        inst_classes = [
+            '__background__', 'person', 'bicycle', 'car', 'motorcycle', 'airplane', 'bus',
+            'train', 'truck', 'boat', 'traffic light', 'fire hydrant', 'N/A', 'stop sign',
+            'parking meter', 'bench', 'bird', 'cat', 'dog', 'horse', 'sheep', 'cow',
+            'elephant', 'bear', 'zebra', 'giraffe', 'N/A', 'backpack', 'umbrella', 'N/A', 'N/A',
+            'handbag', 'tie', 'suitcase', 'frisbee', 'skis', 'snowboard', 'sports ball',
+            'kite', 'baseball bat', 'baseball glove', 'skateboard', 'surfboard', 'tennis racket',
+            'bottle', 'N/A', 'wine glass', 'cup', 'fork', 'knife', 'spoon', 'bowl',
+            'banana', 'apple', 'sandwich', 'orange', 'broccoli', 'carrot', 'hot dog', 'pizza',
+            'donut', 'cake', 'chair', 'couch', 'potted plant', 'bed', 'N/A', 'dining table',
+            'N/A', 'N/A', 'toilet', 'N/A', 'tv', 'laptop', 'mouse', 'remote', 'keyboard', 'cell phone',
+            'microwave', 'oven', 'toaster', 'sink', 'refrigerator', 'N/A', 'book',
+            'clock', 'vase', 'scissors', 'teddy bear', 'hair drier', 'toothbrush'] # a "ordered" list of the coco categories
+        return(inst_classes) 
+
+class MyDataset1(torch.utils.data.Dataset):
     def __init__(self, root = '/home/simon/Documents/Bodies/data/jeppe/', transforms = None):
         self.root = root
         self.transforms = transforms
@@ -488,13 +811,6 @@ class MyDataset(torch.utils.data.Dataset):
                 boxes.append([xmin, ymin, xmax, ymax])
                 # boxes.extend([xmin, ymin, xmax, ymax])
 
-        # come bad boxes
-        # keep = (boxes[:, 3] > boxes[:, 1]) & (boxes[:, 2] > boxes[:, 0]) 
-        # boxes = boxes[keep]
-        # assert xmin >= 0
-        # assert xmin < xmax
-        # assert ymin >= 0
-        # assert ymin < ymax
 
         # convert everything into a torch.Tensor
         boxes = torch.as_tensor(boxes, dtype=torch.float32)
@@ -518,8 +834,7 @@ class MyDataset(torch.utils.data.Dataset):
         if self.transforms is not None:
             img = self.transforms(img)
 
-        # return img, [target] # target now in list....
-        return img, target # target now in list....
+        return img, target
 
 
     def __len__(self):
